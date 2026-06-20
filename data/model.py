@@ -1,0 +1,22 @@
+"""
+data/model.py
+-------------
+Estructura común que usa toda la app para representar una tarjeta del
+dashboard (una recepción, un pedido, una orden de fabricación, etc.),
+sin importar si el dato viene de SAP real o de los datos de demostración.
+"""
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Item:
+    id: str            # Identificador a mostrar, ej. "GRPO-4821"
+    title: str          # Texto principal de la tarjeta
+    subtitle: str        # Texto secundario corto
+    status: str          # "ok" | "warn" | "danger"
+    branch: str           # "León" | "Aguascalientes" | "SLP"
+    detail: dict = field(default_factory=dict)  # Pares clave-valor para el detalle
+
+    @property
+    def status_icon(self) -> str:
+        return {"ok": "🟢", "warn": "🟡", "danger": "🔴"}.get(self.status, "⚪")
