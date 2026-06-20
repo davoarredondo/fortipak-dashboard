@@ -12,14 +12,22 @@ campos propios (UDFs). Los marqué con "# VERIFICAR" donde conviene que
 los confirmes corriendo un SELECT rápido en tu SQL Server antes de usarlos
 en vivo. Esto lo revisamos juntos en la siguiente sesión de programación.
 
+Patrón general:
+Cada categoría trae dos niveles: encabezado del documento (cliente,
+proveedor, fechas, montos) y partidas (qué artículos contiene). Las
+consultas siempre traen el resultado "aplanado" (una fila por partida, con
+los datos del encabezado repetidos), y la función *_from_df() lo agrupa
+por documento para armar un Item con su lista de líneas (`item.lines`).
+Esto es lo que permite que cualquier tarjeta se pueda abrir y mostrar
+exactamente qué contiene, sin una consulta aparte por cada clic.
+
 Sobre el cruce de stock en Pedidos:
 Para cada partida pendiente de un pedido, se compara contra OITW.OnHand
 (existencia física en el almacén de esa partida). Esto es una
 simplificación: lo más correcto suele ser comparar contra "disponible"
-(OnHand - Comprometido + En tránsito), porque parte del OnHand puede ya
-estar comprometido con otro pedido. Lo dejé así para la primera versión
-porque es lo más fácil de verificar a simple vista, y lo afinamos juntos
-con tus reglas reales de cuándo SAP considera algo "disponible".
+(OnHand - Comprometido + En tránsito). Lo dejé así para la primera
+versión porque es lo más fácil de verificar a simple vista, y lo afinamos
+juntos con tus reglas reales de cuándo SAP considera algo "disponible".
 """
 from datetime import datetime
 
@@ -29,40 +37,55 @@ from data.db import run_query
 from data.model import Item
 
 
+def _group_items(df: pd.DataFrame, doc_key: str):
+    """Utilidad común: agrupa un DataFrame "aplanado" (encabezado + partidas)
+    por documento y sucursal, y entrega (encabezado, grupo_de_lineas) por
+    cada documento, en el orden en que aparecen."""
+    if df.empty:
+        return
+    for (doc_num, sucursal), grupo in df.groupby([doc_key, "Sucursal"], sort=False):
+        yield doc_num, sucursal, grupo.iloc[0], grupo
+
+
 # ---------------------------------------------------------------------------
-# Recepciones de proveedores (Purchase Delivery Note — GRPO)
+# Recepciones de proveedores (OPDN + PDN1)
 # ---------------------------------------------------------------------------
 RECEPCIONES_SQL = """
 SELECT
     T0.DocEntry, T0.DocNum, T0.CardCode, T0.CardName AS Proveedor,
-    T0.DocDate, T0.DocTime, T0.DocTotal, T0.NumAtCard, T0.Comments,
-    (SELECT COUNT(*) FROM PDN1 L WHERE L.DocEntry = T0.DocEntry) AS Partidas,
-    (SELECT TOP 1 L.WhsCode FROM PDN1 L WHERE L.DocEntry = T0.DocEntry) AS Almacen
+    T0.DocDate, T0.DocTime, T0.NumAtCard, T0.Comments,
+    T1.LineNum, T1.ItemCode, T1.Dscription, T1.Quantity, T1.Price, T1.WhsCode
 FROM OPDN T0
+JOIN PDN1 T1 ON T1.DocEntry = T0.DocEntry
 WHERE T0.DocDate = CONVERT(date, GETDATE())
-ORDER BY T0.DocTime DESC
+ORDER BY T0.DocNum, T1.LineNum
 """
 
 
 def recepciones_from_df(df: pd.DataFrame) -> list[Item]:
     items = []
-    for _, row in df.iterrows():
+    for doc_num, sucursal, first, grupo in _group_items(df, "DocNum"):
+        lines = [{
+            "Artículo": l.get("Dscription") or l.get("ItemCode"),
+            "Cantidad recibida": l.get("Quantity"),
+            "Precio unitario": f"${l['Price']:,.2f}" if pd.notna(l.get("Price")) else "—",
+            "Almacén": l.get("WhsCode", "—"),
+        } for _, l in grupo.iterrows()]
+
         items.append(Item(
-            id=f"GRPO-{row['DocNum']}",
-            title=f"GRPO-{row['DocNum']}",
-            subtitle=f"{row['Proveedor']} · {row['Sucursal']}",
+            id=f"GRPO-{doc_num}",
+            title=f"GRPO-{doc_num}",
+            subtitle=f"{first['Proveedor']} · {sucursal}",
             status="ok",  # VERIFICAR: definir regla de "atrasado" (ej. cruzar con OC origen)
-            branch=row["Sucursal"],
+            branch=sucursal,
             detail={
-                "Proveedor": row["Proveedor"],
-                "Código proveedor": row.get("CardCode", "—"),
-                "Almacén": row.get("Almacen", "—"),
-                "Fecha": str(row["DocDate"]),
-                "Partidas": row.get("Partidas", "—"),
-                "Monto": f"${row['DocTotal']:,.2f} MXN" if pd.notna(row.get("DocTotal")) else "—",
-                "Referencia proveedor": row.get("NumAtCard", "—"),
-                "Comentarios": row.get("Comments") or "—",
+                "Proveedor": first["Proveedor"],
+                "Código proveedor": first.get("CardCode", "—"),
+                "Fecha": str(first["DocDate"]),
+                "Referencia proveedor": first.get("NumAtCard", "—"),
+                "Comentarios": first.get("Comments") or "—",
             },
+            lines=lines,
         ))
     return items
 
@@ -76,6 +99,7 @@ SELECT
     T0.DocDueDate, T0.Comments, T0.DocTotal,
     S.SlpName AS Vendedor,
     T1.LineNum, T1.ItemCode, T1.Dscription, T1.WhsCode,
+    T1.Quantity,                                  -- cantidad original pedida
     T1.OpenQty,                                   -- VERIFICAR: pendiente por entregar
     W.OnHand AS StockAlmacen                       -- VERIFICAR: ver nota sobre "disponible" arriba
 FROM ORDR T0
@@ -91,10 +115,7 @@ ORDER BY T0.DocNum, T1.LineNum
 
 def pedidos_from_df(df: pd.DataFrame) -> list[Item]:
     items = []
-    if df.empty:
-        return items
-    for (doc_num, sucursal), grupo in df.groupby(["DocNum", "Sucursal"]):
-        first = grupo.iloc[0]
+    for doc_num, sucursal, first, grupo in _group_items(df, "DocNum"):
         lines = []
         hay_insuficiente = False
         hay_justo = False
@@ -113,6 +134,7 @@ def pedidos_from_df(df: pd.DataFrame) -> list[Item]:
                 estatus = "🟢 Cubierto"
             lines.append({
                 "Artículo": l.get("Dscription") or l.get("ItemCode"),
+                "Cantidad pedida": l.get("Quantity"),
                 "Pendiente por entregar": pendiente,
                 f"Stock disponible ({l.get('WhsCode', '—')})": stock,
                 "Estatus": estatus,
@@ -168,10 +190,7 @@ def _picking_status(sap_status: str) -> str:
 
 def picking_from_df(df: pd.DataFrame) -> list[Item]:
     items = []
-    if df.empty:
-        return items
-    for (abs_entry, sucursal), grupo in df.groupby(["AbsEntry", "Sucursal"]):
-        first = grupo.iloc[0]
+    for abs_entry, sucursal, first, grupo in _group_items(df, "AbsEntry"):
         lines = []
         for _, l in grupo.iterrows():
             a_surtir = l.get("ReleasedQuantity", 0) or 0
@@ -200,54 +219,65 @@ def picking_from_df(df: pd.DataFrame) -> list[Item]:
 
 
 # ---------------------------------------------------------------------------
-# Traslados pendientes entre almacenes (Inventory Transfer Request — OWTQ)
+# Traslados pendientes entre almacenes (OWTQ + WTQ1)
 # ---------------------------------------------------------------------------
 # VERIFICAR: si en FORTIPAK no usan "solicitud de traslado" (OWTQ) y crean
-# directamente el traslado (OWTR), cambiar esta consulta a OWTR.
+# directamente el traslado (OWTR), cambiar esta consulta a OWTR + WTR1.
 TRASLADOS_SQL = """
 SELECT
     T0.DocEntry, T0.DocNum, T0.DocDate, T0.Comments,
-    (SELECT TOP 1 L.FromWhsCode FROM WTQ1 L WHERE L.DocEntry = T0.DocEntry) AS Origen,
-    (SELECT TOP 1 L.WhsCode FROM WTQ1 L WHERE L.DocEntry = T0.DocEntry) AS Destino,
-    (SELECT COUNT(*) FROM WTQ1 L WHERE L.DocEntry = T0.DocEntry) AS Partidas
+    T1.LineNum, T1.ItemCode, T1.Dscription, T1.Quantity,
+    T1.FromWhsCode AS Origen, T1.WhsCode AS Destino
 FROM OWTQ T0
+JOIN WTQ1 T1 ON T1.DocEntry = T0.DocEntry
 WHERE T0.DocStatus = 'O'
-ORDER BY T0.DocDate ASC
+ORDER BY T0.DocNum, T1.LineNum
 """
 
 
 def traslados_from_df(df: pd.DataFrame) -> list[Item]:
     items = []
-    for _, row in df.iterrows():
-        dias = (datetime.now().date() - pd.to_datetime(row["DocDate"]).date()).days
+    for doc_num, sucursal, first, grupo in _group_items(df, "DocNum"):
+        dias = (datetime.now().date() - pd.to_datetime(first["DocDate"]).date()).days
         status = "danger" if dias >= 1 else "warn"
+        lines = [{
+            "Artículo": l.get("Dscription") or l.get("ItemCode"),
+            "Cantidad": l.get("Quantity"),
+            "Origen": l.get("Origen", "—"),
+            "Destino": l.get("Destino", "—"),
+        } for _, l in grupo.iterrows()]
+
         items.append(Item(
-            id=f"WTR-{row['DocNum']}",
-            title=f"WTR-{row['DocNum']}",
-            subtitle=f"{row.get('Origen', '—')} → {row.get('Destino', '—')}",
+            id=f"WTR-{doc_num}",
+            title=f"WTR-{doc_num}",
+            subtitle=f"{first.get('Origen', '—')} → {first.get('Destino', '—')}",
             status=status,
-            branch=row["Sucursal"],
+            branch=sucursal,
             detail={
-                "Origen": row.get("Origen", "—"),
-                "Destino": row.get("Destino", "—"),
-                "Partidas": row.get("Partidas", "—"),
-                "Fecha de solicitud": str(row["DocDate"]),
-                "Comentarios": row.get("Comments") or "—",
+                "Origen": first.get("Origen", "—"),
+                "Destino": first.get("Destino", "—"),
+                "Fecha de solicitud": str(first["DocDate"]),
+                "Comentarios": first.get("Comments") or "—",
             },
+            lines=lines,
         ))
     return items
 
 
 # ---------------------------------------------------------------------------
-# Órdenes de fabricación en proceso (OWOR)
+# Órdenes de fabricación en proceso (OWOR + WOR1 = componentes)
 # ---------------------------------------------------------------------------
 PRODUCCION_SQL = """
 SELECT
     T0.DocEntry, T0.DocNum, T0.ItemCode, T0.ProdName,
-    T0.PlannedQty, T0.CmpltQty, T0.DueDate, T0.WhsCode
+    T0.PlannedQty, T0.CmpltQty, T0.DueDate, T0.WhsCode,
+    T1.LineNum, T1.ItemCode AS ComponenteCode, T1.ItemName AS ComponenteDesc,
+    T1.PlannedQty AS ComponentePlaneado,
+    T1.IssuedQty AS ComponenteEmitido    -- VERIFICAR nombre exacto de columna
 FROM OWOR T0
+JOIN WOR1 T1 ON T1.DocEntry = T0.DocEntry
 WHERE T0.Status = 'R'  -- VERIFICAR: 'R' = Released/en proceso
-ORDER BY T0.DueDate ASC
+ORDER BY T0.DocNum, T1.LineNum
 """
 
 
@@ -265,95 +295,118 @@ def _produccion_status(planned, completed, due_date) -> str:
 
 def produccion_from_df(df: pd.DataFrame) -> list[Item]:
     items = []
-    for _, row in df.iterrows():
-        planned, completed = row.get("PlannedQty", 0), row.get("CmpltQty", 0)
+    for doc_num, sucursal, first, grupo in _group_items(df, "DocNum"):
+        planned, completed = first.get("PlannedQty", 0), first.get("CmpltQty", 0)
         avance_pct = round((completed / planned) * 100) if planned else 0
+        lines = [{
+            "Componente": l.get("ComponenteDesc") or l.get("ComponenteCode"),
+            "Planeado": l.get("ComponentePlaneado"),
+            "Emitido": l.get("ComponenteEmitido"),
+            "Pendiente": max((l.get("ComponentePlaneado") or 0) - (l.get("ComponenteEmitido") or 0), 0),
+        } for _, l in grupo.iterrows()]
+
         items.append(Item(
-            id=f"OF-{row['DocNum']}",
-            title=f"OF-{row['DocNum']}",
-            subtitle=f"{row['Sucursal']} · {avance_pct}%",
-            status=_produccion_status(planned, completed, row.get("DueDate")),
-            branch=row["Sucursal"],
+            id=f"OF-{doc_num}",
+            title=f"OF-{doc_num}",
+            subtitle=f"{sucursal} · {avance_pct}%",
+            status=_produccion_status(planned, completed, first.get("DueDate")),
+            branch=sucursal,
             detail={
-                "Producto": row.get("ProdName") or "—",
-                "Código artículo": row.get("ItemCode", "—"),
-                "Almacén": row.get("WhsCode", "—"),
+                "Producto": first.get("ProdName") or "—",
+                "Código artículo": first.get("ItemCode", "—"),
+                "Almacén": first.get("WhsCode", "—"),
                 "Cantidad planeada": planned,
                 "Cantidad completada": completed,
                 "Avance": f"{avance_pct}%",
-                "Fecha compromiso": str(row.get("DueDate") or "—"),
+                "Fecha compromiso": str(first.get("DueDate") or "—"),
             },
+            lines=lines,
         ))
     return items
 
 
 # ---------------------------------------------------------------------------
-# Entregas a clientes (ODLN), del día
+# Entregas a clientes (ODLN + DLN1), del día
 # ---------------------------------------------------------------------------
 ENTREGAS_SQL = """
 SELECT
     T0.DocEntry, T0.DocNum, T0.CardCode, T0.CardName AS Cliente,
-    T0.DocDate, T0.DocTime, T0.DocTotal, T0.Comments,
-    (SELECT COUNT(*) FROM DLN1 L WHERE L.DocEntry = T0.DocEntry) AS Partidas,
-    (SELECT TOP 1 L.BaseEntry FROM DLN1 L WHERE L.DocEntry = T0.DocEntry AND L.BaseType = 17) AS PedidoOrigenEntry
+    T0.DocDate, T0.DocTime, T0.Comments,
+    T1.LineNum, T1.ItemCode, T1.Dscription, T1.Quantity, T1.Price, T1.WhsCode,
+    T1.BaseEntry AS PedidoOrigenEntry, T1.BaseType
 FROM ODLN T0
+JOIN DLN1 T1 ON T1.DocEntry = T0.DocEntry
 WHERE T0.DocDate = CONVERT(date, GETDATE())
-ORDER BY T0.DocTime DESC
+ORDER BY T0.DocNum, T1.LineNum
 """
 
 
 def entregas_from_df(df: pd.DataFrame) -> list[Item]:
     items = []
-    for _, row in df.iterrows():
+    for doc_num, sucursal, first, grupo in _group_items(df, "DocNum"):
+        lines = [{
+            "Artículo": l.get("Dscription") or l.get("ItemCode"),
+            "Cantidad entregada": l.get("Quantity"),
+            "Precio unitario": f"${l['Price']:,.2f}" if pd.notna(l.get("Price")) else "—",
+            "Almacén": l.get("WhsCode", "—"),
+        } for _, l in grupo.iterrows()]
+
         items.append(Item(
-            id=f"DLN-{row['DocNum']}",
-            title=f"DLN-{row['DocNum']}",
-            subtitle=f"{row['Cliente']} · {row['Sucursal']}",
+            id=f"DLN-{doc_num}",
+            title=f"DLN-{doc_num}",
+            subtitle=f"{first['Cliente']} · {sucursal}",
             status="ok",  # VERIFICAR: cruzar con hora comprometida si la registran
-            branch=row["Sucursal"],
+            branch=sucursal,
             detail={
-                "Cliente": row["Cliente"],
-                "Código cliente": row.get("CardCode", "—"),
-                "Partidas": row.get("Partidas", "—"),
-                "Monto": f"${row['DocTotal']:,.2f} MXN" if pd.notna(row.get("DocTotal")) else "—",
-                "Pedido origen (DocEntry)": row.get("PedidoOrigenEntry", "—"),
-                "Comentarios": row.get("Comments") or "—",
+                "Cliente": first["Cliente"],
+                "Código cliente": first.get("CardCode", "—"),
+                "Pedido origen (DocEntry)": first.get("PedidoOrigenEntry", "—"),
+                "Comentarios": first.get("Comments") or "—",
             },
+            lines=lines,
         ))
     return items
 
 
 # ---------------------------------------------------------------------------
-# Facturas emitidas a clientes (OINV), del día
+# Facturas emitidas a clientes (OINV + INV1), del día
 # ---------------------------------------------------------------------------
 FACTURACION_SQL = """
 SELECT
     T0.DocEntry, T0.DocNum, T0.CardCode, T0.CardName AS Cliente,
     T0.DocDate, T0.DocTotal, T0.PaidToDate,
-    (SELECT TOP 1 L.BaseEntry FROM INV1 L WHERE L.DocEntry = T0.DocEntry AND L.BaseType = 15) AS EntregaOrigenEntry
+    T1.LineNum, T1.ItemCode, T1.Dscription, T1.Quantity, T1.Price, T1.LineTotal
 FROM OINV T0
+JOIN INV1 T1 ON T1.DocEntry = T0.DocEntry
 WHERE T0.DocDate = CONVERT(date, GETDATE())
-ORDER BY T0.DocDate DESC
+ORDER BY T0.DocNum, T1.LineNum
 """
 
 
 def facturacion_from_df(df: pd.DataFrame) -> list[Item]:
     items = []
-    for _, row in df.iterrows():
-        saldo = (row.get("DocTotal", 0) or 0) - (row.get("PaidToDate", 0) or 0)
+    for doc_num, sucursal, first, grupo in _group_items(df, "DocNum"):
+        saldo = (first.get("DocTotal", 0) or 0) - (first.get("PaidToDate", 0) or 0)
+        lines = [{
+            "Artículo": l.get("Dscription") or l.get("ItemCode"),
+            "Cantidad facturada": l.get("Quantity"),
+            "Precio unitario": f"${l['Price']:,.2f}" if pd.notna(l.get("Price")) else "—",
+            "Importe": f"${l['LineTotal']:,.2f}" if pd.notna(l.get("LineTotal")) else "—",
+        } for _, l in grupo.iterrows()]
+
         items.append(Item(
-            id=f"Factura {row['DocNum']}",
-            title=f"Factura {row['DocNum']}",
-            subtitle=f"{row['Cliente']} · {row['Sucursal']}",
+            id=f"Factura {doc_num}",
+            title=f"Factura {doc_num}",
+            subtitle=f"{first['Cliente']} · {sucursal}",
             status="ok",
-            branch=row["Sucursal"],
+            branch=sucursal,
             detail={
-                "Cliente": row["Cliente"],
-                "Código cliente": row.get("CardCode", "—"),
-                "Monto": f"${row['DocTotal']:,.2f} MXN",
+                "Cliente": first["Cliente"],
+                "Código cliente": first.get("CardCode", "—"),
+                "Monto": f"${first['DocTotal']:,.2f} MXN",
                 "Saldo pendiente": f"${saldo:,.2f} MXN",
-                "Entrega origen (DocEntry)": row.get("EntregaOrigenEntry", "—"),
             },
+            lines=lines,
         ))
     return items
 
