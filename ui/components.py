@@ -4,17 +4,18 @@ ui/components.py
 Piezas reutilizables de la interfaz: la fila de KPIs, el banner de avisos
 urgentes, y cada "carril" (lane) con sus tarjetas.
 
-Sobre el diseño de cada tarjeta:
-Cada tarjeta es un mini-recuadro (st.container(border=True)) con 3 líneas
-siempre visibles, sin necesidad de hacer clic:
-  - Estatus + identificador del documento (ej. "🟢 Pedido 1023")
-  - A quién/qué corresponde (ej. "Cliente: Nissan Aguascalientes",
-    "Proveedor: Aceros SA", "Almacén: PT-LEON → PT-SLP")
-  - El dato de tiempo más relevante (ej. "Entrega: 16:00")
-Debajo, un botón "Ver detalle" abre el popover con todo lo demás: datos
-completos del documento y, si aplica, la tabla de partidas (con clic en
-una fila para ver su detalle completo: solicitado, entregado, almacén,
-stock).
+Sobre el detalle de cada tarjeta (MUY IMPORTANTE):
+El detalle se abre en un st.dialog (modal centrado, ancho fijo grande),
+NO en un st.popover. Un popover hereda el ancho de la columna angosta
+donde vive su botón disparador, así que la tabla de partidas se cortaba.
+Un modal es independiente de esa columna: siempre se ve ancho, y por eso
+se pueden mostrar TODAS las columnas de la tabla de partidas de una sola
+vez (Artículo, Solicitado, Entregado/Recibido, Pendiente, Almacén, Stock
+en almacén) sin tener que hacer clic en cada línea para verlas.
+
+st.dialog funciona como decorador: se define una sola vez, y para mostrar
+datos distintos en cada llamada se guarda el item a mostrar en
+st.session_state antes de invocar la función decorada.
 
 Sobre los colores por sección:
 Cada carril se dibuja dentro de un st.container(key=f"lane_{lane}", border=True).
@@ -28,6 +29,13 @@ import streamlit as st
 
 from data.constants import LANES, LANE_LABELS
 from data.model import Item
+
+ACTIVE_ITEM_KEY = "_fp_active_item"
+DIALOG_OPEN_KEY = "_fp_dialog_open"
+
+
+def _close_dialog():
+    st.session_state[DIALOG_OPEN_KEY] = False
 
 
 def render_kpis(items_by_lane: dict[str, list[Item]]):
@@ -80,37 +88,32 @@ def _line_status(pendiente, stock) -> str:
     return "🟢 Cubierto"
 
 
-def _render_lines_table(lines: list[dict], widget_key: str):
-    df = pd.DataFrame(lines)
-    label_col = df.columns[0]
+@st.dialog("Detalle del documento", width="large", on_dismiss=_close_dialog)
+def _detail_dialog():
+    item: Item = st.session_state.get(ACTIVE_ITEM_KEY)
+    if not item:
+        st.write("Sin información para mostrar.")
+        return
 
-    if "Estatus" not in df.columns and {"Pendiente", "Stock en almacén"}.issubset(df.columns):
-        df["Estatus"] = [
-            _line_status(p, s) for p, s in zip(df["Pendiente"], df["Stock en almacén"])
-        ]
+    st.markdown(f'<p class="fp-card-title">{item.status_icon} {item.title}</p>', unsafe_allow_html=True)
+    st.markdown(f'<p class="fp-card-subtitle">{item.subtitle}</p>', unsafe_allow_html=True)
+    st.divider()
 
-    if "Pendiente" in df.columns:
-        compact_cols = [c for c in [label_col, "Pendiente", "Estatus"] if c in df.columns]
-    else:
-        compact_cols = list(df.columns)
+    for key, value in item.detail.items():
+        st.write(f"**{key}:** {value}")
 
-    event = st.dataframe(
-        df, width="stretch", hide_index=True,
-        column_order=compact_cols,
-        on_select="rerun", selection_mode="single-row",
-        key=widget_key,
-    )
-
-    selected_rows = event.selection.rows if event and event.selection else []
-    if selected_rows:
-        line = lines[selected_rows[0]]
-        st.markdown(f"**Detalle completo — {line.get(label_col, '')}**")
-        fields = [(k, v) for k, v in line.items() if k != label_col]
-        detail_cols = st.columns(min(len(fields), 4) or 1)
-        for i, (k, v) in enumerate(fields):
-            detail_cols[i % len(detail_cols)].metric(k, v if v not in (None, "") else "—")
-    else:
-        st.caption("Haz clic en una fila para ver su detalle completo (solicitado, entregado, almacén, stock).")
+    if item.lines:
+        st.divider()
+        st.caption("Detalle por partida — todas las columnas visibles, sin necesidad de ampliar cada línea")
+        df = pd.DataFrame(item.lines)
+        if "Estatus" not in df.columns and {"Pendiente", "Stock en almacén"}.issubset(df.columns):
+            df["Estatus"] = [
+                _line_status(p, s) for p, s in zip(df["Pendiente"], df["Stock en almacén"])
+            ]
+        st.dataframe(
+            df, width="stretch", hide_index=True, height=min(38 + 35 * len(df), 400),
+            key=f"dialog_lines_{_slug(item.id)}",
+        )
 
 
 def _render_card(item: Item, key_suffix: str = ""):
@@ -121,18 +124,18 @@ def _render_card(item: Item, key_suffix: str = ""):
             f'<p class="fp-mini-when">{item.when or "&nbsp;"}</p>',
             unsafe_allow_html=True,
         )
-        with st.popover("Ver detalle", width="stretch"):
-            st.markdown(f'<p class="fp-card-title">{item.title}</p>', unsafe_allow_html=True)
-            st.markdown(f'<p class="fp-card-subtitle">{item.subtitle}</p>', unsafe_allow_html=True)
-            st.divider()
-            for key, value in item.detail.items():
-                st.write(f"**{key}:** {value}")
+        btn_key = f"btn_{_slug(item.id)}_{key_suffix}"
+        if st.button("Ver detalle", key=btn_key, width="stretch"):
+            st.session_state[ACTIVE_ITEM_KEY] = item
+            st.session_state[DIALOG_OPEN_KEY] = True
 
-            if item.lines:
-                st.divider()
-                st.caption("Detalle por partida")
-                widget_key = f"lines_{_slug(item.id)}_{key_suffix}"
-                _render_lines_table(item.lines, widget_key)
+
+def maybe_reopen_dialog():
+    """Si había un detalle abierto antes del último refresco automático,
+    lo vuelve a mostrar en este run. Llamar una sola vez, al final del
+    layout principal (después de dibujar todos los carriles)."""
+    if st.session_state.get(DIALOG_OPEN_KEY):
+        _detail_dialog()
 
 
 def render_lane(lane: str, items: list[Item]):

@@ -77,7 +77,7 @@ def dashboard():
             selected_branches = components.render_branch_selector(config.BRANCHES)
         with col_b:
             st.write("")
-            if st.button("🔄 Actualizar", width='stretch'):
+            if st.button("🔄 Actualizar", key="refresh_btn", width='stretch'):
                 st.rerun()
 
     with st.spinner("Cargando información..."):
@@ -91,10 +91,12 @@ def dashboard():
     for lane in LANES:
         components.render_lane(lane, items_by_lane.get(lane, []))
 
+    components.maybe_reopen_dialog()
+
     with st.sidebar:
         st.markdown("#### Sesión")
         st.write(st.session_state.user_name)
-        if st.button("Cerrar sesión"):
+        if st.button("Cerrar sesión", key="logout_btn"):
             st.session_state.authenticated = False
             st.session_state.user_name = None
             st.rerun()
