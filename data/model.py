@@ -6,6 +6,7 @@ dashboard (una recepción, un pedido, una orden de fabricación, etc.),
 sin importar si el dato viene de SAP real o de los datos de demostración.
 """
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -16,6 +17,8 @@ class Item:
     status: str          # "ok" | "warn" | "danger"
     branch: str           # "León" | "Aguascalientes" | "SLP"
     detail: dict = field(default_factory=dict)  # Pares clave-valor para el detalle
+    lines: Optional[list[dict]] = None  # Detalle por partida (ej. partidas de un pedido
+                                          # con pendiente por entregar vs. stock disponible)
 
     @property
     def status_icon(self) -> str:

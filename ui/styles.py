@@ -1,32 +1,58 @@
 """
 ui/styles.py
 -------------
-Estilos visuales de la app. Streamlit no trae "tarjetas de color" como
-componente nativo, así que usamos un poco de CSS propio para que el
-banner de avisos urgentes y los encabezados de cada sección se vean como
-en el diseño aprobado.
+Estilos visuales de la app. La idea central de este archivo: Streamlit ya
+soporta dar una "clase CSS" a un st.container(key="algo") -> se renderiza
+como `.st-key-algo` en el HTML. Usamos eso para pintar cada sección
+(carril) con su propio color, sin necesidad de componentes externos.
 """
 import streamlit as st
 
-CUSTOM_CSS = """
+from data.constants import LANE_COLORS
+
+BASE_CSS = """
 <style>
-.fp-header {
-    display: flex; justify-content: space-between; align-items: center;
-    margin-bottom: 0.5rem;
-}
 .fp-subtitle { color: #6b7280; font-size: 0.85rem; margin: 0; }
 .fp-lane-title {
-    font-weight: 600; font-size: 0.95rem; margin: 1.1rem 0 0.3rem 0;
-    display: flex; align-items: center; gap: 0.4rem;
+    font-weight: 700; font-size: 1rem; margin: 0 0 0.6rem 0;
+    display: flex; align-items: center; gap: 0.45rem;
 }
-.fp-alert-banner {
-    background: #FCEBEB; border: 1px solid #F09595; border-radius: 10px;
-    padding: 0.9rem 1.1rem; margin-bottom: 1rem;
+.fp-lane-count { font-weight: 400; opacity: 0.65; font-size: 0.85rem; }
+.fp-card-title { font-weight: 600; font-size: 0.85rem; margin: 0; }
+.fp-card-subtitle { font-size: 0.78rem; opacity: 0.75; margin: 0; }
+
+/* Banner de avisos urgentes: contenedor con key="urgent_banner" */
+.st-key-urgent_banner {
+    background: #fef2f2 !important;
+    border: 1px solid #fca5a5 !important;
+    border-radius: 12px !important;
 }
-.fp-alert-title { color: #791F1F; font-weight: 600; font-size: 0.9rem; margin: 0 0 0.5rem 0; }
+.st-key-urgent_banner .fp-lane-title { color: #991b1b; }
+
+/* Fila de KPIs: fondo neutro suave para diferenciarla de los carriles */
+.st-key-kpi_row {
+    background: #f8fafc !important;
+    border-radius: 12px !important;
+    border: 1px solid #e2e8f0 !important;
+    padding-top: 0.4rem !important;
+}
 </style>
 """
 
 
+def _lane_css(lane: str, colors: dict) -> str:
+    # Cada carril es un st.container(key=f"lane_{lane}") -> clase .st-key-lane_<lane>
+    return f"""
+    .st-key-lane_{lane} {{
+        background: {colors['bg']} !important;
+        border-left: 6px solid {colors['accent']} !important;
+        border-radius: 10px !important;
+    }}
+    .st-key-lane_{lane} .fp-lane-title {{ color: {colors['text']}; }}
+    """
+
+
 def inject():
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    lane_css = "".join(_lane_css(lane, colors) for lane, colors in LANE_COLORS.items())
+    st.markdown(BASE_CSS, unsafe_allow_html=True)
+    st.markdown(f"<style>{lane_css}</style>", unsafe_allow_html=True)
